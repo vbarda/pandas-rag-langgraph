@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "pandas-rag-langgraph"
+version = "0.1.0"
+description = ""
+authors = ["vbarda <vadym@langchain.dev>"]
+readme = "README.md"
+
+
+[tool.poetry.dependencies]
+python = "^3.11"
+beautifulsoup4 = "^4.12.3"
+chromadb = "^0.5.0"
+tiktoken = "^0.7.0"
+langchain-core = "^0.2.5"
+langchain-community = "^0.2.4"
+langchain-text-splitters = "^0.2.1"
+langgraph = "^0.0.69"
+langchain-openai = "^0.1.9"
+langchainhub = "^0.1.20"
+
+
+[tool.poetry.group.dev.dependencies]
+langgraph-cli = "^0.1.35"
+langgraph-sdk = "^0.1.18"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

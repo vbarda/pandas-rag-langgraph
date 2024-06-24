@@ -8,6 +8,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.retrievers import BaseRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph import END, StateGraph
@@ -33,7 +34,7 @@ class PandasDocsLoader(web_base.WebBaseLoader):
             yield Document(page_content=text, metadata=metadata)
 
 
-def prepare_documents(urls):
+def prepare_documents(urls: list[str]) -> list[Document]:
     text_splitter = RecursiveCharacterTextSplitter(
         separators=[
             r"In \[[0-9]+\]",
@@ -48,7 +49,7 @@ def prepare_documents(urls):
     return text_splitter.split_documents(docs_list)
 
 
-def get_retriever():
+def get_retriever() -> BaseRetriever:
     documents = prepare_documents(SOURCE_URLS)
     vectorstore = Chroma.from_documents(
         documents=documents,
@@ -61,6 +62,7 @@ def get_retriever():
 
 # LLM / Retriever
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
+retrieval_grader_llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 retriever = get_retriever()
 
 
@@ -192,7 +194,7 @@ def generate(state: GraphState, config):
     Returns:
         state (dict): New key added to state, generation, that contains LLM generation
     """
-
+    print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
     retries = state["retries"] if state.get("retries") is not None else -1
@@ -201,7 +203,6 @@ def generate(state: GraphState, config):
     if retries >= max_retries:
         return {"generation": NOT_ENOUGH_INFORMATION}
 
-    print("---GENERATE---")
     # RAG generation
     rag_chain = RAG_PROMPT | llm | StrOutputParser()
     generation = rag_chain.invoke({"context": documents, "question": question})
@@ -218,11 +219,10 @@ def grade_documents(state: GraphState):
     Returns:
         state (dict): Updates documents key with only filtered relevant documents
     """
-
     print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
     question = state["question"]
     documents = state["documents"]
-    retrieval_grader = RETRIEVAL_GRADER_PROMPT | llm.with_structured_output(GradeDocuments)
+    retrieval_grader = RETRIEVAL_GRADER_PROMPT | retrieval_grader_llm.with_structured_output(GradeDocuments)
 
     # Score each doc
     filtered_docs = []
@@ -235,7 +235,7 @@ def grade_documents(state: GraphState):
     return {"documents": filtered_docs, "question": question}
 
 
-def transform_query(state):
+def transform_query(state: GraphState):
     """
     Transform the query to produce a better question.
 
@@ -245,21 +245,21 @@ def transform_query(state):
     Returns:
         state (dict): Updates question key with a re-phrased question
     """
-
     print("---TRANSFORM QUERY---")
     question = state["question"]
     documents = state["documents"]
+    retries = state["retries"] if state.get("retries") is not None else -1
 
     # Re-write question
     query_rewriter = QUERY_REWRITER_PROMPT | llm | StrOutputParser()
     better_question = query_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question}
+    return {"documents": documents, "question": better_question, "retries": retries + 1}
 
 
 ### Edges
 
 
-def decide_to_generate(state) -> Literal["transform_query", "generate"]:
+def decide_to_generate(state: GraphState, config) -> Literal["transform_query", "generate"]:
     """
     Determines whether to generate an answer, or re-generate a question.
 
@@ -269,12 +269,13 @@ def decide_to_generate(state) -> Literal["transform_query", "generate"]:
     Returns:
         str: Binary decision for next node to call
     """
-
     print("---ASSESS GRADED DOCUMENTS---")
     state["question"]
     filtered_documents = state["documents"]
+    retries = state["retries"] if state.get("retries") is not None else -1
+    max_retries = config.get("configurable", {}).get("max_retries", 3)
 
-    if not filtered_documents:
+    if not filtered_documents and retries < max_retries:
         # All documents have been filtered check_relevance
         # We will re-generate a new query
         print(
@@ -282,12 +283,12 @@ def decide_to_generate(state) -> Literal["transform_query", "generate"]:
         )
         return "transform_query"
     else:
-        # We have relevant documents, so generate answer
+        # We have relevant documents or we ran out of retries, so generate answer
         print("---DECISION: GENERATE---")
         return "generate"
 
 
-def grade_generation_v_documents_and_question(state):
+def grade_generation_v_documents_and_question(state: GraphState) -> Literal["not enough information", "not grounded", "useful", "not useful"]:
     """
     Determines whether the generation is grounded in the document and answers question.
 
