@@ -1,11 +1,13 @@
 import re
-from typing import Iterator, Literal, TypedDict
+from typing import Annotated, Iterator, TypedDict
 
 from langchain import hub
 from langchain_community.document_loaders import web_base
 from langchain_community.vectorstores import Chroma
+from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import BaseMessage, AIMessage, convert_to_messages
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.retrievers import BaseRetriever
@@ -13,6 +15,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph import END, StateGraph
 
+from pandas_rag_langgraph.utils import RemoveMessage, add_messages
+
+MAX_RETRIES = 3
 
 # Index 3 pages from Pandas user guides
 SOURCE_URLS = [
@@ -60,37 +65,14 @@ def get_retriever() -> BaseRetriever:
     return retriever
 
 
-# LLM / Retriever
+# LLM / Retriever / Tools
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
-retrieval_grader_llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 retriever = get_retriever()
-
+tavily_search_tool = TavilySearchResults(max_results=1)
 
 # Prompts / data models
 
 RAG_PROMPT: ChatPromptTemplate = hub.pull("rlm/rag-prompt")
-
-class GradeDocuments(BaseModel):
-    """Binary score for relevance check on retrieved documents."""
-
-    binary_score: str = Field(
-        description="Documents are relevant to the question, 'yes' or 'no'"
-    )
-
-RETRIEVAL_GRADER_SYSTEM = (
-"""
-You are a grader assessing relevance of a retrieved document to a user question.
-Your goal is to filter out erroneous retrievals.
-If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant.
-Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.
-"""
-)
-RETRIEVAL_GRADER_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", RETRIEVAL_GRADER_SYSTEM),
-        ("human", "Retrieved document: \n\n {document} \n\n User question: {question}"),
-    ]
-)
 
 
 class GradeHallucinations(BaseModel):
@@ -157,13 +139,11 @@ QUERY_REWRITER_PROMPT = ChatPromptTemplate.from_messages(
 
 
 class GraphState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
     question: str
-    generation: str
     documents: list[Document]
     retries: int
-
-
-NOT_ENOUGH_INFORMATION = "Not enough information to answer"
+    web_fallback: bool
 
 
 def retrieve(state: GraphState):
@@ -177,11 +157,11 @@ def retrieve(state: GraphState):
         state (dict): New key added to state, documents, that contains retrieved documents
     """
     print("---RETRIEVE---")
-    question = state["question"]
+    question = state["question"] or convert_to_messages(state["messages"])[-1].content
 
     # Retrieval
     documents = retriever.invoke(question)
-    return {"documents": documents, "question": question}
+    return {"documents": documents, "question": question, "web_fallback": True}
 
 
 def generate(state: GraphState, config):
@@ -198,41 +178,23 @@ def generate(state: GraphState, config):
     question = state["question"]
     documents = state["documents"]
     retries = state["retries"] if state.get("retries") is not None else -1
-    max_retries = config.get("configurable", {}).get("max_retries", 3)
+    max_retries = config.get("configurable", {}).get("max_retries", MAX_RETRIES)
+    web_fallback = state["web_fallback"]
 
-    if retries >= max_retries:
-        return {"generation": NOT_ENOUGH_INFORMATION}
-
-    # RAG generation
-    rag_chain = RAG_PROMPT | llm | StrOutputParser()
+    rag_chain = RAG_PROMPT | llm
     generation = rag_chain.invoke({"context": documents, "question": question})
-    return {"documents": documents, "question": question, "generation": generation, "retries": retries + 1}
 
+    state_update = {"retries": retries + 1}
+    if retries >= max_retries and web_fallback:
+        state_update["web_fallback"] = False
 
-def grade_documents(state: GraphState):
-    """
-    Determines whether the retrieved documents are relevant to the question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        state (dict): Updates documents key with only filtered relevant documents
-    """
-    print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
-    question = state["question"]
-    documents = state["documents"]
-    retrieval_grader = RETRIEVAL_GRADER_PROMPT | retrieval_grader_llm.with_structured_output(GradeDocuments)
-
-    # Score each doc
-    filtered_docs = []
-    grades: list[GradeDocuments] = retrieval_grader.batch([
-        {"question": question, "document": d.page_content}
-        for d in documents
-    ])
-    filtered_docs = [doc for doc, grade in zip(documents, grades) if grade.binary_score == "yes"]
-    print(f"---GRADE: {len(filtered_docs)}/{len(documents)} RELEVANT DOCUMENTS---")
-    return {"documents": filtered_docs, "question": question}
+    # make sure to remove previous AI message if we're regenerating
+    last_message = convert_to_messages(state["messages"])[-1]
+    if isinstance(last_message, AIMessage):
+        state_update["messages"] = [RemoveMessage(id=last_message.id), generation]
+    else:
+        state_update["messages"] = [generation]
+    return state_update
 
 
 def transform_query(state: GraphState):
@@ -247,48 +209,27 @@ def transform_query(state: GraphState):
     """
     print("---TRANSFORM QUERY---")
     question = state["question"]
-    documents = state["documents"]
-    retries = state["retries"] if state.get("retries") is not None else -1
 
     # Re-write question
     query_rewriter = QUERY_REWRITER_PROMPT | llm | StrOutputParser()
     better_question = query_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question, "retries": retries + 1}
+    return {"question": better_question}
+
+
+def web_search(state: GraphState):
+    print("---RUNNING WEB SEARCH---")
+    question = state["question"]
+    documents = state["documents"]
+    search_results = tavily_search_tool.invoke(question)
+    search_content = "\n".join([d["content"] for d in search_results])
+    documents.append( Document(page_content=search_content))
+    return {"documents": documents}
 
 
 ### Edges
 
 
-def decide_to_generate(state: GraphState, config) -> Literal["transform_query", "generate"]:
-    """
-    Determines whether to generate an answer, or re-generate a question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        str: Binary decision for next node to call
-    """
-    print("---ASSESS GRADED DOCUMENTS---")
-    state["question"]
-    filtered_documents = state["documents"]
-    retries = state["retries"] if state.get("retries") is not None else -1
-    max_retries = config.get("configurable", {}).get("max_retries", 3)
-
-    if not filtered_documents and retries < max_retries:
-        # All documents have been filtered check_relevance
-        # We will re-generate a new query
-        print(
-            "---DECISION: ALL DOCUMENTS ARE NOT RELEVANT TO QUESTION, TRANSFORM QUERY---"
-        )
-        return "transform_query"
-    else:
-        # We have relevant documents or we ran out of retries, so generate answer
-        print("---DECISION: GENERATE---")
-        return "generate"
-
-
-def grade_generation_v_documents_and_question(state: GraphState) -> Literal["not enough information", "not grounded", "useful", "not useful"]:
+def grade_generation_v_documents_and_question(state: GraphState, config):
     """
     Determines whether the generation is grounded in the document and answers question.
 
@@ -300,21 +241,24 @@ def grade_generation_v_documents_and_question(state: GraphState) -> Literal["not
     """
     question = state["question"]
     documents = state["documents"]
-    generation = state["generation"]
+    generation = convert_to_messages(state["messages"])[-1]
+    web_fallback = state["web_fallback"]
+    retries = state["retries"] if state.get("retries") is not None else -1
+    max_retries = config.get("configurable", {}).get("max_retries", MAX_RETRIES)
 
-    if generation == NOT_ENOUGH_INFORMATION:
-        return "not enough information"
+    if retries >= max_retries:
+        return "web_search" if web_fallback else END
 
     print("---CHECK HALLUCINATIONS---")
     hallucination_grader = HALLUCINATION_GRADER_PROMPT | llm.with_structured_output(GradeHallucinations)
     hallucination_grade: GradeHallucinations = hallucination_grader.invoke(
-        {"documents": documents, "generation": generation}
+        {"documents": documents, "generation": generation.content}
     )
 
     # Check hallucination
     if hallucination_grade.binary_score != "yes":
         print("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
-        return "not grounded"
+        return "generate"
 
     print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
 
@@ -322,13 +266,13 @@ def grade_generation_v_documents_and_question(state: GraphState) -> Literal["not
     print("---GRADE GENERATION vs QUESTION---")
 
     answer_grader = ANSWER_GRADER_PROMPT | llm.with_structured_output(GradeAnswer)
-    answer_grade: GradeAnswer = answer_grader.invoke({"question": question, "generation": generation})
+    answer_grade: GradeAnswer = answer_grader.invoke({"question": question, "generation": generation.content})
     if answer_grade.binary_score == "yes":
         print("---DECISION: GENERATION ADDRESSES QUESTION---")
-        return "useful"
+        return END
     else:
         print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
-        return "not useful"
+        return "transform_query"
 
 
 # Define graph
@@ -337,25 +281,19 @@ workflow = StateGraph(GraphState)
 
 # Define the nodes
 workflow.add_node("retrieve", retrieve)
-workflow.add_node("grade_documents", grade_documents)
 workflow.add_node("generate", generate)
 workflow.add_node("transform_query", transform_query)
+workflow.add_node("web_search", web_search)
 
 # Build graph
 workflow.set_entry_point("retrieve")
-workflow.add_edge("retrieve", "grade_documents")
-workflow.add_conditional_edges("grade_documents", decide_to_generate)
+workflow.add_edge("retrieve", "generate")
 workflow.add_edge("transform_query", "retrieve")
+workflow.add_edge("web_search", "generate")
 
 workflow.add_conditional_edges(
     "generate",
-    grade_generation_v_documents_and_question,
-    {
-        "not grounded": "generate",
-        "not useful": "transform_query",
-        "useful": END,
-        "not enough information": END
-    },
+    grade_generation_v_documents_and_question
 )
 
 # Compile
