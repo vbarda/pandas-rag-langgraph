@@ -1,17 +1,20 @@
 import re
-from typing import Iterator, Literal, TypedDict
+from typing import Annotated, Iterator, Literal, TypedDict
 
 from langchain import hub
 from langchain_community.document_loaders import web_base
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import BaseMessage, AIMessage, convert_to_messages
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.retrievers import BaseRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph import END, StateGraph
+
+from pandas_rag_langgraph.utils import RemoveMessage, add_messages
 
 
 # Index 3 pages from Pandas user guides
@@ -157,8 +160,8 @@ QUERY_REWRITER_PROMPT = ChatPromptTemplate.from_messages(
 
 
 class GraphState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
     question: str
-    generation: str
     documents: list[Document]
     retries: int
 
@@ -177,7 +180,7 @@ def retrieve(state: GraphState):
         state (dict): New key added to state, documents, that contains retrieved documents
     """
     print("---RETRIEVE---")
-    question = state["question"]
+    question = convert_to_messages(state["messages"])[-1].content
 
     # Retrieval
     documents = retriever.invoke(question)
@@ -200,13 +203,20 @@ def generate(state: GraphState, config):
     retries = state["retries"] if state.get("retries") is not None else -1
     max_retries = config.get("configurable", {}).get("max_retries", 3)
 
-    if retries >= max_retries:
-        return {"generation": NOT_ENOUGH_INFORMATION}
+    if retries < max_retries:
+        rag_chain = RAG_PROMPT | llm
+        generation = rag_chain.invoke({"context": documents, "question": question})
+    else:
+        generation = AIMessage(content=NOT_ENOUGH_INFORMATION)
 
-    # RAG generation
-    rag_chain = RAG_PROMPT | llm | StrOutputParser()
-    generation = rag_chain.invoke({"context": documents, "question": question})
-    return {"documents": documents, "question": question, "generation": generation, "retries": retries + 1}
+    state_update = {"retries": retries + 1}
+    # make sure to remove previous AI message if we're regenerating
+    last_message = convert_to_messages(state["messages"])[-1]
+    if isinstance(last_message, AIMessage):
+        state_update["messages"] = [RemoveMessage(id=last_message.id), generation]
+    else:
+        state_update["messages"] = [generation]
+    return state_update
 
 
 def grade_documents(state: GraphState):
@@ -232,7 +242,7 @@ def grade_documents(state: GraphState):
     ])
     filtered_docs = [doc for doc, grade in zip(documents, grades) if grade.binary_score == "yes"]
     print(f"---GRADE: {len(filtered_docs)}/{len(documents)} RELEVANT DOCUMENTS---")
-    return {"documents": filtered_docs, "question": question}
+    return {"documents": filtered_docs}
 
 
 def transform_query(state: GraphState):
@@ -247,13 +257,13 @@ def transform_query(state: GraphState):
     """
     print("---TRANSFORM QUERY---")
     question = state["question"]
-    documents = state["documents"]
+
     retries = state["retries"] if state.get("retries") is not None else -1
 
     # Re-write question
     query_rewriter = QUERY_REWRITER_PROMPT | llm | StrOutputParser()
     better_question = query_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question, "retries": retries + 1}
+    return {"question": better_question, "retries": retries + 1}
 
 
 ### Edges
@@ -270,7 +280,6 @@ def decide_to_generate(state: GraphState, config) -> Literal["transform_query", 
         str: Binary decision for next node to call
     """
     print("---ASSESS GRADED DOCUMENTS---")
-    state["question"]
     filtered_documents = state["documents"]
     retries = state["retries"] if state.get("retries") is not None else -1
     max_retries = config.get("configurable", {}).get("max_retries", 3)
@@ -300,15 +309,15 @@ def grade_generation_v_documents_and_question(state: GraphState) -> Literal["not
     """
     question = state["question"]
     documents = state["documents"]
-    generation = state["generation"]
+    generation = convert_to_messages(state["messages"])[-1]
 
-    if generation == NOT_ENOUGH_INFORMATION:
+    if generation.content == NOT_ENOUGH_INFORMATION:
         return "not enough information"
 
     print("---CHECK HALLUCINATIONS---")
     hallucination_grader = HALLUCINATION_GRADER_PROMPT | llm.with_structured_output(GradeHallucinations)
     hallucination_grade: GradeHallucinations = hallucination_grader.invoke(
-        {"documents": documents, "generation": generation}
+        {"documents": documents, "generation": generation.content}
     )
 
     # Check hallucination
@@ -322,7 +331,7 @@ def grade_generation_v_documents_and_question(state: GraphState) -> Literal["not
     print("---GRADE GENERATION vs QUESTION---")
 
     answer_grader = ANSWER_GRADER_PROMPT | llm.with_structured_output(GradeAnswer)
-    answer_grade: GradeAnswer = answer_grader.invoke({"question": question, "generation": generation})
+    answer_grade: GradeAnswer = answer_grader.invoke({"question": question, "generation": generation.content})
     if answer_grade.binary_score == "yes":
         print("---DECISION: GENERATION ADDRESSES QUESTION---")
         return "useful"
