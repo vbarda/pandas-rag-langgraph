@@ -1,5 +1,5 @@
 import re
-from typing import Annotated, Iterator, TypedDict
+from typing import Annotated, Iterator, Literal, TypedDict
 
 from langchain import hub
 from langchain_community.document_loaders import web_base
@@ -221,7 +221,6 @@ def web_search(state: GraphState):
 ### Edges
 
 
-from typing import Literal
 def grade_generation_v_documents_and_question(state: GraphState, config) -> Literal["generate", "transform_query", "web_search", "finalize_response"]:
     """
     Determines whether the generation is grounded in the document and answers question.
