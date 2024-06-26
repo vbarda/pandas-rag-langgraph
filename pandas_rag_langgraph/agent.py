@@ -1,5 +1,5 @@
 import re
-from typing import Annotated, Iterator, TypedDict
+from typing import Annotated, Iterator, Literal, TypedDict
 
 from langchain import hub
 from langchain_community.document_loaders import web_base
@@ -13,9 +13,7 @@ from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.retrievers import BaseRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langgraph.graph import END, StateGraph
-
-from pandas_rag_langgraph.utils import RemoveMessage, add_messages
+from langgraph.graph import END, StateGraph, add_messages
 
 MAX_RETRIES = 3
 
@@ -142,11 +140,12 @@ class GraphState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     question: str
     documents: list[Document]
+    candidate_answer: str
     retries: int
     web_fallback: bool
 
 
-def retrieve(state: GraphState):
+def document_search(state: GraphState):
     """
     Retrieve documents
 
@@ -157,7 +156,7 @@ def retrieve(state: GraphState):
         state (dict): New key added to state, documents, that contains retrieved documents
     """
     print("---RETRIEVE---")
-    question = state["question"] or convert_to_messages(state["messages"])[-1].content
+    question = convert_to_messages(state["messages"])[-1].content
 
     # Retrieval
     documents = retriever.invoke(question)
@@ -181,19 +180,12 @@ def generate(state: GraphState, config):
     max_retries = config.get("configurable", {}).get("max_retries", MAX_RETRIES)
     web_fallback = state["web_fallback"]
 
-    rag_chain = RAG_PROMPT | llm
+    rag_chain = RAG_PROMPT | llm | StrOutputParser()
     generation = rag_chain.invoke({"context": documents, "question": question})
 
-    state_update = {"retries": retries + 1}
+    state_update = {"retries": retries + 1, "candidate_answer": generation}
     if retries >= max_retries and web_fallback:
         state_update["web_fallback"] = False
-
-    # make sure to remove previous AI message if we're regenerating
-    last_message = convert_to_messages(state["messages"])[-1]
-    if isinstance(last_message, AIMessage):
-        state_update["messages"] = [RemoveMessage(id=last_message.id), generation]
-    else:
-        state_update["messages"] = [generation]
     return state_update
 
 
@@ -222,14 +214,14 @@ def web_search(state: GraphState):
     documents = state["documents"]
     search_results = tavily_search_tool.invoke(question)
     search_content = "\n".join([d["content"] for d in search_results])
-    documents.append( Document(page_content=search_content))
+    documents.append(Document(page_content=search_content, metadata={"source": "websearch"}))
     return {"documents": documents}
 
 
 ### Edges
 
 
-def grade_generation_v_documents_and_question(state: GraphState, config):
+def grade_generation_v_documents_and_question(state: GraphState, config) -> Literal["generate", "transform_query", "web_search", "finalize_response"]:
     """
     Determines whether the generation is grounded in the document and answers question.
 
@@ -241,18 +233,18 @@ def grade_generation_v_documents_and_question(state: GraphState, config):
     """
     question = state["question"]
     documents = state["documents"]
-    generation = convert_to_messages(state["messages"])[-1]
+    generation = state["candidate_answer"]
     web_fallback = state["web_fallback"]
     retries = state["retries"] if state.get("retries") is not None else -1
     max_retries = config.get("configurable", {}).get("max_retries", MAX_RETRIES)
 
     if retries >= max_retries:
-        return "web_search" if web_fallback else END
+        return "web_search" if web_fallback else "finalize_response"
 
     print("---CHECK HALLUCINATIONS---")
     hallucination_grader = HALLUCINATION_GRADER_PROMPT | llm.with_structured_output(GradeHallucinations)
     hallucination_grade: GradeHallucinations = hallucination_grader.invoke(
-        {"documents": documents, "generation": generation.content}
+        {"documents": documents, "generation": generation}
     )
 
     # Check hallucination
@@ -266,13 +258,18 @@ def grade_generation_v_documents_and_question(state: GraphState, config):
     print("---GRADE GENERATION vs QUESTION---")
 
     answer_grader = ANSWER_GRADER_PROMPT | llm.with_structured_output(GradeAnswer)
-    answer_grade: GradeAnswer = answer_grader.invoke({"question": question, "generation": generation.content})
+    answer_grade: GradeAnswer = answer_grader.invoke({"question": question, "generation": generation})
     if answer_grade.binary_score == "yes":
         print("---DECISION: GENERATION ADDRESSES QUESTION---")
-        return END
+        return "finalize_response"
     else:
         print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
         return "transform_query"
+
+
+def finalize_response(state: GraphState):
+    print("---FINALIZING THE RESPONSE---")
+    return {"messages": [AIMessage(content=state["candidate_answer"])]}
 
 
 # Define graph
@@ -280,16 +277,18 @@ def grade_generation_v_documents_and_question(state: GraphState, config):
 workflow = StateGraph(GraphState)
 
 # Define the nodes
-workflow.add_node("retrieve", retrieve)
+workflow.add_node("document_search", document_search)
 workflow.add_node("generate", generate)
 workflow.add_node("transform_query", transform_query)
 workflow.add_node("web_search", web_search)
+workflow.add_node("finalize_response", finalize_response)
 
 # Build graph
-workflow.set_entry_point("retrieve")
-workflow.add_edge("retrieve", "generate")
-workflow.add_edge("transform_query", "retrieve")
+workflow.set_entry_point("document_search")
+workflow.add_edge("document_search", "generate")
+workflow.add_edge("transform_query", "document_search")
 workflow.add_edge("web_search", "generate")
+workflow.add_edge("finalize_response", END)
 
 workflow.add_conditional_edges(
     "generate",
