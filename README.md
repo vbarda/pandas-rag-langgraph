@@ -1,6 +1,6 @@
 # Pandas RAG with LangGraph
 
-This is a demo app for a RAG system that answers questions about [Pandas](https://pandas.pydata.org/) documentation powered by [LangGraph]() and [LangChain]().
+This is a demo app for a RAG system that answers questions about [Pandas](https://pandas.pydata.org/) documentation powered by [LangGraph](https://github.com/langchain-ai/langgraph) and [LangChain](https://github.com/langchain-ai/langchain).
 
 ## Data
 
@@ -43,6 +43,8 @@ The flow is as follows:
 6. (Optional) Generate an answer based on the web search results and return it to the user
 
 See this flow chart for a visual representation.
+
+![rag-agent](/static/pandas-rag-agent.png)
 
 ## Interacting with the graph
 
