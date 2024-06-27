@@ -27,7 +27,7 @@ The demo uses the following components:
 
 ## Architecture
 
-This demo implements a custom RAG architecture that combines ideas from Self-RAG and Corrective RAG. For simplicity, it omits the document relevance grading step, but you can find full implementation of those papers in LangGraph [here](https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_self_rag/) and [here](https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_crag/).
+This demo implements a custom RAG architecture that combines ideas from [Self-RAG](https://arxiv.org/abs/2310.11511) and [Corrective RAG](https://arxiv.org/abs/2401.15884). For simplicity, it omits the document relevance grading step, but you can find full implementation of those papers in LangGraph [here](https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_self_rag/) and [here](https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_crag/).
 
 The flow is as follows:
 
