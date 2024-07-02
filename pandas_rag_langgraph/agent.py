@@ -168,7 +168,7 @@ def document_search(state: GraphState):
     return {"documents": documents, "question": question, "web_fallback": True}
 
 
-def generate(state: GraphState, config):
+def generate(state: GraphState):
     """
     Generate answer
 
@@ -182,16 +182,10 @@ def generate(state: GraphState, config):
     question = state["question"]
     documents = state["documents"]
     retries = state["retries"] if state.get("retries") is not None else -1
-    max_retries = config.get("configurable", {}).get("max_retries", MAX_RETRIES)
-    web_fallback = state["web_fallback"]
 
     rag_chain = RAG_PROMPT | llm | StrOutputParser()
     generation = rag_chain.invoke({"context": documents, "question": question})
-
-    state_update = {"retries": retries + 1, "candidate_answer": generation}
-    if retries >= max_retries and web_fallback:
-        state_update["web_fallback"] = False
-    return state_update
+    return {"retries": retries + 1, "candidate_answer": generation}
 
 
 def transform_query(state: GraphState):
@@ -220,7 +214,7 @@ def web_search(state: GraphState):
     search_results = tavily_search_tool.invoke(question)
     search_content = "\n".join([d["content"] for d in search_results])
     documents.append(Document(page_content=search_content, metadata={"source": "websearch"}))
-    return {"documents": documents}
+    return {"documents": documents, "web_fallback": False}
 
 
 ### Edges
@@ -243,8 +237,9 @@ def grade_generation_v_documents_and_question(state: GraphState, config) -> Lite
     retries = state["retries"] if state.get("retries") is not None else -1
     max_retries = config.get("configurable", {}).get("max_retries", MAX_RETRIES)
 
-    if retries >= max_retries:
-        return "web_search" if web_fallback else "finalize_response"
+    # this means we've already gone through web fallback and can return to the user
+    if not web_fallback:
+        return "finalize_response"
 
     print("---CHECK HALLUCINATIONS---")
     hallucination_grader = HALLUCINATION_GRADER_PROMPT | llm.with_structured_output(GradeHallucinations)
@@ -253,9 +248,8 @@ def grade_generation_v_documents_and_question(state: GraphState, config) -> Lite
     )
 
     # Check hallucination
-    if hallucination_grade.binary_score != "yes":
-        print("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
-        return "generate"
+    if hallucination_grade.binary_score == "no":
+        return "generate" if retries < max_retries else "web_search"
 
     print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
 
@@ -269,7 +263,7 @@ def grade_generation_v_documents_and_question(state: GraphState, config) -> Lite
         return "finalize_response"
     else:
         print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
-        return "transform_query"
+        return "transform_query" if retries < max_retries else "web_search"
 
 
 def finalize_response(state: GraphState):
